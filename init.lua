@@ -12,6 +12,28 @@ local builder = {
 local current_vehicle = nil
 
 ------------------------------------------------------------
+-- Blueprints (plans de véhicules) sauvegardés
+------------------------------------------------------------
+
+local storage = minetest.get_mod_storage()
+
+local blueprints = {}
+do
+    local raw = storage:get_string("moving_nodes_blueprints")
+    if raw and raw ~= "" then
+        local t = minetest.deserialize(raw)
+        if type(t) == "table" then
+            blueprints = t
+        end
+    end
+end
+
+local function save_blueprints()
+    storage:set_string("moving_nodes_blueprints", minetest.serialize(blueprints))
+end
+
+
+------------------------------------------------------------
 -- Helpers
 ------------------------------------------------------------
 
@@ -453,6 +475,152 @@ minetest.register_tool("moving_nodes:harness", {
         return itemstack
     end,
 })
+
+------------------------------------------------------------
+-- /moving_nodes_save <nom>
+-- Sauvegarde la structure collée actuellement dans un plan nommé
+------------------------------------------------------------
+
+minetest.register_chatcommand("moving_nodes_save", {
+    params = "<nom>",
+    description = "Sauvegarde la structure actuelle comme un plan nommé",
+    func = function(name, param)
+        local bp_name = param:match("^(%S+)$")
+        if not bp_name then
+            return false, "[moving_nodes] Utilisation : /moving_nodes_save <nom>"
+        end
+
+        if not builder.origin or #builder.nodes == 0 then
+            return false, "[moving_nodes] Aucune structure à sauvegarder (utilise l'outil de colle d'abord)."
+        end
+
+        -- Construire le blueprint (offsets + types de nodes)
+        local origin = builder.origin
+        local offsets = {}
+        local nodes = {}
+
+        for i, abs_pos in ipairs(builder.nodes) do
+            local off = vector.subtract(abs_pos, origin)
+            offsets[i] = {
+                x = off.x,
+                y = off.y,
+                z = off.z,
+            }
+
+            local node = minetest.get_node(abs_pos)
+            nodes[i] = {
+                name = node.name,
+                param2 = node.param2 or 0,
+            }
+        end
+
+        blueprints[bp_name] = {
+            offsets = offsets,
+            nodes = nodes,
+        }
+        save_blueprints()
+
+        return true, "[moving_nodes] Plan \"" .. bp_name .. "\" sauvegardé (" .. #offsets .. " nodes)."
+    end,
+})
+
+------------------------------------------------------------
+-- /moving_nodes_list
+-- Liste les plans disponibles
+------------------------------------------------------------
+
+minetest.register_chatcommand("moving_nodes_list", {
+    description = "Liste les plans de véhicules sauvegardés",
+    func = function(name, param)
+        local names = {}
+        for bp_name, bp in pairs(blueprints) do
+            table.insert(names, bp_name .. " (" .. #bp.offsets .. " nodes)")
+        end
+
+        if #names == 0 then
+            return true, "[moving_nodes] Aucun plan sauvegardé."
+        end
+
+        table.sort(names)
+        return true, "[moving_nodes] Plans disponibles : " .. table.concat(names, ", ")
+    end,
+})
+
+------------------------------------------------------------
+-- /moving_nodes_delete <nom>
+-- Supprime un plan
+------------------------------------------------------------
+
+minetest.register_chatcommand("moving_nodes_delete", {
+    params = "<nom>",
+    description = "Supprime un plan de véhicule sauvegardé",
+    func = function(name, param)
+        local bp_name = param:match("^(%S+)$")
+        if not bp_name then
+            return false, "[moving_nodes] Utilisation : /moving_nodes_delete <nom>"
+        end
+
+        if not blueprints[bp_name] then
+            return false, "[moving_nodes] Plan \"" .. bp_name .. "\" introuvable."
+        end
+
+        blueprints[bp_name] = nil
+        save_blueprints()
+
+        return true, "[moving_nodes] Plan \"" .. bp_name .. "\" supprimé."
+    end,
+})
+
+------------------------------------------------------------
+-- /moving_nodes_load <nom>
+-- Recrée la structure d'un plan sous le joueur et la sélectionne
+------------------------------------------------------------
+
+minetest.register_chatcommand("moving_nodes_load", {
+    params = "<nom>",
+    description = "Charge un plan de véhicule et recrée la structure sous le joueur",
+    func = function(name, param)
+        local bp_name = param:match("^(%S+)$")
+        if not bp_name then
+            return false, "[moving_nodes] Utilisation : /moving_nodes_load <nom>"
+        end
+
+        local bp = blueprints[bp_name]
+        if not bp then
+            return false, "[moving_nodes] Plan \"" .. bp_name .. "\" introuvable."
+        end
+
+        if current_vehicle then
+            return false, "[moving_nodes] Un véhicule existe déjà. Utilise /moving_nodes_reset avant de charger un plan."
+        end
+
+        local player = minetest.get_player_by_name(name)
+        if not player then
+            return false, "[moving_nodes] Joueur introuvable."
+        end
+
+        local base_pos = vector.round(player:get_pos())
+
+        -- On efface l'ancien builder
+        builder_clear()
+
+        builder.origin = vector.new(base_pos)
+        builder.nodes = {}
+
+        -- Recréer les nodes dans le monde
+        for i, off in ipairs(bp.offsets) do
+            local nd = bp.nodes[i]
+            if nd and nd.name and nd.name ~= "air" then
+                local pos = vector.add(base_pos, off)
+                minetest.set_node(pos, { name = nd.name, param2 = nd.param2 or 0 })
+                table.insert(builder.nodes, pos)
+            end
+        end
+
+        return true, "[moving_nodes] Plan \"" .. bp_name .. "\" chargé à ta position. Utilise le harnais pour créer le véhicule."
+    end,
+})
+
 
 ------------------------------------------------------------
 -- COMMANDE : reset complet
