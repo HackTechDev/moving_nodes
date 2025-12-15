@@ -646,3 +646,282 @@ minetest.register_chatcommand("moving_nodes_reset", {
     end,
 })
 
+------------------------------------------------------------
+-- Sélection de volume (pos1/pos2) + collage automatique
+------------------------------------------------------------
+
+local selections = {} -- selections[playername] = {pos1=..., pos2=...}
+
+local function get_pointed_node_pos(player)
+    local pt = player and player:get_pointed_thing()
+    if pt and pt.type == "node" then
+        return pt.under
+    end
+    return nil
+end
+
+local function set_sel(name, which, pos)
+    selections[name] = selections[name] or {}
+    selections[name][which] = vector.round(pos)
+end
+
+local function get_sel(name)
+    local s = selections[name]
+    if not s or not s.pos1 or not s.pos2 then return nil end
+    return s.pos1, s.pos2
+end
+
+local function minmax(a, b)
+    return math.min(a, b), math.max(a, b)
+end
+
+local function volume_size(p1, p2)
+    local x1, x2 = minmax(p1.x, p2.x)
+    local y1, y2 = minmax(p1.y, p2.y)
+    local z1, z2 = minmax(p1.z, p2.z)
+    return (x2 - x1 + 1) * (y2 - y1 + 1) * (z2 - z1 + 1)
+end
+
+-- /moving_nodes_pos1 [point]
+-- Sans argument: prend la position du joueur (arrondie)
+-- Avec "point": prend le node visé
+minetest.register_chatcommand("moving_nodes_pos1", {
+    params = "[point]",
+    description = "Définit le coin 1 du volume (utilise 'point' pour prendre le node visé)",
+    func = function(name, param)
+        local player = minetest.get_player_by_name(name)
+        if not player then return false, "[moving_nodes] Joueur introuvable." end
+
+        local pos
+        if param == "point" then
+            pos = get_pointed_node_pos(player)
+            if not pos then
+                return false, "[moving_nodes] Aucun node visé."
+            end
+        else
+            pos = player:get_pos()
+        end
+
+        set_sel(name, "pos1", pos)
+        local p1 = selections[name].pos1
+        return true, ("[moving_nodes] pos1 = %d,%d,%d"):format(p1.x, p1.y, p1.z)
+    end,
+})
+
+-- /moving_nodes_pos2 [point]
+minetest.register_chatcommand("moving_nodes_pos2", {
+    params = "[point]",
+    description = "Définit le coin 2 du volume (utilise 'point' pour prendre le node visé)",
+    func = function(name, param)
+        local player = minetest.get_player_by_name(name)
+        if not player then return false, "[moving_nodes] Joueur introuvable." end
+
+        local pos
+        if param == "point" then
+            pos = get_pointed_node_pos(player)
+            if not pos then
+                return false, "[moving_nodes] Aucun node visé."
+            end
+        else
+            pos = player:get_pos()
+        end
+
+        set_sel(name, "pos2", pos)
+        local p2 = selections[name].pos2
+        return true, ("[moving_nodes] pos2 = %d,%d,%d"):format(p2.x, p2.y, p2.z)
+    end,
+})
+
+-- /moving_nodes_fill
+-- Colle tous les nodes (non-air) dans le volume pos1-pos2
+minetest.register_chatcommand("moving_nodes_fill", {
+    description = "Colle tous les nodes (non-air) inclus dans le volume pos1-pos2",
+    func = function(name, param)
+        if current_vehicle then
+            return false, "[moving_nodes] Un véhicule existe déjà. Utilise /moving_nodes_reset avant."
+        end
+
+        local p1, p2 = get_sel(name)
+        if not p1 or not p2 then
+            return false, "[moving_nodes] Définis d'abord pos1 et pos2 avec /moving_nodes_pos1 et /moving_nodes_pos2."
+        end
+
+        local max_nodes = 20000 -- garde-fou anti-lag
+        local total = volume_size(p1, p2)
+        if total > max_nodes then
+            return false, ("[moving_nodes] Volume trop grand (%d nodes). Limite: %d."):format(total, max_nodes)
+        end
+
+        -- On remplace la sélection actuelle
+        builder_clear()
+
+        local x1, x2 = minmax(p1.x, p2.x)
+        local y1, y2 = minmax(p1.y, p2.y)
+        local z1, z2 = minmax(p1.z, p2.z)
+
+        -- Origine stable = coin "min" du volume
+        builder.origin = {x = x1, y = y1, z = z1}
+
+        local count = 0
+        for z = z1, z2 do
+            for y = y1, y2 do
+                for x = x1, x2 do
+                    local pos = {x = x, y = y, z = z}
+                    local node = minetest.get_node(pos)
+                    if node and node.name and node.name ~= "air" and node.name ~= "ignore" then
+                        table.insert(builder.nodes, vector.new(pos))
+                        count = count + 1
+                    end
+                end
+            end
+        end
+
+        if count == 0 then
+            builder_clear()
+            return true, "[moving_nodes] Aucun node non-air dans le volume."
+        end
+
+        return true, ("[moving_nodes] %d nodes collés depuis le volume. Origine=%d,%d,%d"):format(
+            count, builder.origin.x, builder.origin.y, builder.origin.z
+        )
+    end,
+})
+
+-- Optionnel : reset juste la sélection pos1/pos2
+minetest.register_chatcommand("moving_nodes_selclear", {
+    description = "Efface pos1/pos2 pour toi",
+    func = function(name, param)
+        selections[name] = nil
+        return true, "[moving_nodes] Sélection effacée."
+    end,
+})
+
+
+------------------------------------------------------------
+-- Aperçu visuel de la sélection (particules coins + contour)
+------------------------------------------------------------
+
+local PREVIEW_INTERVAL = 0.25      -- secondes
+local PREVIEW_LIFETIME = 0.35      -- doit être >= interval pour éviter clignotement
+local PREVIEW_MAX_POINTS = 1200    -- limite anti-lag (arêtes)
+local PREVIEW_STEP = 1             -- 1 = chaque node, 2 = un point sur 2, etc.
+
+local function minmax(a, b) return math.min(a, b), math.max(a, b) end
+
+local function get_box(p1, p2)
+    local x1, x2 = minmax(p1.x, p2.x)
+    local y1, y2 = minmax(p1.y, p2.y)
+    local z1, z2 = minmax(p1.z, p2.z)
+    return x1, y1, z1, x2, y2, z2
+end
+
+local function add_particle(playername, pos, size)
+    minetest.add_particle({
+        pos = {x = pos.x + 0.5, y = pos.y + 0.5, z = pos.z + 0.5},
+        velocity = {x = 0, y = 0, z = 0},
+        acceleration = {x = 0, y = 0, z = 0},
+        expirationtime = PREVIEW_LIFETIME,
+        size = size or 6,
+        collisiondetection = false,
+        collision_removal = false,
+        object_collision = false,
+        vertical = false,
+        texture = "default_mese_crystal_fragment.png",
+        glow = 10,
+        playername = playername, -- particule visible uniquement pour ce joueur
+    })
+end
+
+local function add_edge_points(playername, a, b, step)
+    step = step or PREVIEW_STEP
+    local dx = b.x - a.x
+    local dy = b.y - a.y
+    local dz = b.z - a.z
+
+    local n = math.max(math.abs(dx), math.abs(dy), math.abs(dz))
+    if n == 0 then
+        add_particle(playername, a, 4)
+        return 1
+    end
+
+    local count = 0
+    for i = 0, n, step do
+        local t = i / n
+        local p = {
+            x = math.floor(a.x + dx * t + 0.5),
+            y = math.floor(a.y + dy * t + 0.5),
+            z = math.floor(a.z + dz * t + 0.5),
+        }
+        add_particle(playername, p, 2)
+        count = count + 1
+        if count >= PREVIEW_MAX_POINTS then
+            break
+        end
+    end
+    return count
+end
+
+local function show_selection_preview(playername, p1, p2)
+    local x1, y1, z1, x2, y2, z2 = get_box(p1, p2)
+
+    -- 8 coins
+    local c000 = {x=x1, y=y1, z=z1}
+    local c100 = {x=x2, y=y1, z=z1}
+    local c010 = {x=x1, y=y2, z=z1}
+    local c110 = {x=x2, y=y2, z=z1}
+    local c001 = {x=x1, y=y1, z=z2}
+    local c101 = {x=x2, y=y1, z=z2}
+    local c011 = {x=x1, y=y2, z=z2}
+    local c111 = {x=x2, y=y2, z=z2}
+
+    -- coins plus visibles
+    add_particle(playername, c000, 8)
+    add_particle(playername, c100, 8)
+    add_particle(playername, c010, 8)
+    add_particle(playername, c110, 8)
+    add_particle(playername, c001, 8)
+    add_particle(playername, c101, 8)
+    add_particle(playername, c011, 8)
+    add_particle(playername, c111, 8)
+
+    -- 12 arêtes (contour)
+    local used = 0
+    used = used + add_edge_points(playername, c000, c100)
+    used = used + add_edge_points(playername, c000, c010)
+    used = used + add_edge_points(playername, c000, c001)
+
+    used = used + add_edge_points(playername, c111, c101)
+    used = used + add_edge_points(playername, c111, c110)
+    used = used + add_edge_points(playername, c111, c011)
+
+    used = used + add_edge_points(playername, c001, c101)
+    used = used + add_edge_points(playername, c001, c011)
+
+    used = used + add_edge_points(playername, c010, c110)
+    used = used + add_edge_points(playername, c010, c011)
+
+    used = used + add_edge_points(playername, c100, c110)
+    used = used + add_edge_points(playername, c100, c101)
+end
+
+-- Boucle globale : rafraîchit l’aperçu pour chaque joueur ayant une sélection
+local preview_timer = 0
+minetest.register_globalstep(function(dtime)
+    preview_timer = preview_timer + dtime
+    if preview_timer < PREVIEW_INTERVAL then return end
+    preview_timer = 0
+
+    for playername, sel in pairs(selections) do
+        if sel and sel.pos1 and sel.pos2 then
+            local player = minetest.get_player_by_name(playername)
+            if player then
+                -- Option : ne pas afficher si trop loin (anti spam visuel)
+                -- local pp = vector.round(player:get_pos())
+                -- if vector.distance(pp, sel.pos1) < 200 or vector.distance(pp, sel.pos2) < 200 then
+                show_selection_preview(playername, sel.pos1, sel.pos2)
+                -- end
+            end
+        end
+    end
+end)
+
