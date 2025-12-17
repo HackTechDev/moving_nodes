@@ -1,6 +1,7 @@
 ------------------------------------------------------------
 -- moving_nodes : véhicule + structure collée + collisions --
 -- + sélection volume + preview particules + blueprints     --
+-- + mouvement fluide (accel/friction + glissement)         --
 ------------------------------------------------------------
 
 -------------------------
@@ -48,7 +49,7 @@ local function pos_equal(a, b)
 end
 
 local function world_pos_from_origin(origin, offset)
-    -- On convertit origin (float) + offset (int) en pos monde (int)
+    -- Convertit origin (float) + offset (int) en pos monde (int)
     return {
         x = math.floor(origin.x + offset.x + 0.5),
         y = math.floor(origin.y + offset.y + 0.5),
@@ -77,7 +78,6 @@ local function get_pointed_node_pos(player, range)
     local pos = player:get_pos()
     if not pos then return nil end
 
-    -- oeil approx : ajouter eye_height si dispo
     local props = player:get_properties() or {}
     local eye = vector.new(pos)
     eye.y = eye.y + (props.eye_height or 1.47)
@@ -131,7 +131,7 @@ local function add_particle(playername, pos, size)
         vertical = false,
         texture = "default_mese_crystal_fragment.png",
         glow = 10,
-        playername = playername, -- visible seulement pour ce joueur (si supporté par ta version)
+        playername = playername, -- visible seulement pour ce joueur (si supporté)
     })
 end
 
@@ -173,7 +173,6 @@ local function show_selection_preview(playername, p1, p2)
     local c011 = {x=x1, y=y2, z=z2}
     local c111 = {x=x2, y=y2, z=z2}
 
-    -- Coins
     add_particle(playername, c000, 8)
     add_particle(playername, c100, 8)
     add_particle(playername, c010, 8)
@@ -183,7 +182,6 @@ local function show_selection_preview(playername, p1, p2)
     add_particle(playername, c011, 8)
     add_particle(playername, c111, 8)
 
-    -- 12 arêtes
     add_edge_points(playername, c000, c100)
     add_edge_points(playername, c000, c010)
     add_edge_points(playername, c000, c001)
@@ -241,7 +239,6 @@ minetest.register_tool("moving_nodes:glue", {
 
         local pos = pointed_thing.under
 
-        -- Retirer si déjà présent
         for i, p in ipairs(builder.nodes) do
             if pos_equal(p, pos) then
                 table.remove(builder.nodes, i)
@@ -250,7 +247,6 @@ minetest.register_tool("moving_nodes:glue", {
                     builder.origin = nil
                     minetest.chat_send_player(name, "[moving_nodes] Structure vide.")
                 else
-                    -- Si on a retiré l'origine, on la recale sur le premier node restant
                     if builder.origin and pos_equal(builder.origin, pos) then
                         builder.origin = vector.new(builder.nodes[1])
                     end
@@ -400,11 +396,7 @@ local function copy_structure_from_builder(self)
         nodes[i] = { name = nd.name, param2 = nd.param2 or 0 }
     end
 
-    self.structure = {
-        origin = origin,      -- float (on peut y accumuler des deltas)
-        offsets = offsets,    -- int
-        nodes = nodes,        -- node defs
-    }
+    self.structure = { origin = origin, offsets = offsets, nodes = nodes }
 end
 
 local function can_move_structure(structure, delta)
@@ -412,7 +404,6 @@ local function can_move_structure(structure, delta)
         return false
     end
 
-    -- index des positions actuelles de la structure (pour ignorer auto-collision)
     local current_index = {}
     for _, off in ipairs(structure.offsets) do
         local p = world_pos_from_origin(structure.origin, off)
@@ -428,7 +419,6 @@ local function can_move_structure(structure, delta)
         if not current_index[key] then
             local node = minetest.get_node(dest)
             local def = minetest.registered_nodes[node.name]
-
             if node.name ~= "air" and node.name ~= "ignore" then
                 if not def or def.walkable then
                     return false
@@ -436,7 +426,6 @@ local function can_move_structure(structure, delta)
             end
         end
     end
-
     return true
 end
 
@@ -462,18 +451,15 @@ local function move_structure(structure, delta)
         end
     end
 
-    -- Si aucun node ne change de case (delta trop petit), on garde juste l'origine à jour
     if not changed then
         structure.origin = new_origin
         return
     end
 
-    -- supprimer les anciens
     for _, p in ipairs(old_positions) do
         minetest.remove_node(p)
     end
 
-    -- placer les nouveaux
     for i, p in ipairs(new_positions) do
         local nd = structure.nodes[i]
         if nd and nd.name and nd.name ~= "air" then
@@ -485,7 +471,7 @@ local function move_structure(structure, delta)
 end
 
 ------------------------------------------------------------
--- ENTITÉ VÉHICULE (invisible)
+-- ENTITÉ VÉHICULE (invisible) + mouvement fluide
 ------------------------------------------------------------
 
 minetest.register_entity("moving_nodes:vehicle", {
@@ -496,19 +482,21 @@ minetest.register_entity("moving_nodes:vehicle", {
         selectionbox = {-0.5, -0.5, -0.5, 0.5, 0.5, 0.5},
         visual = "cube",
         visual_size = {x = 1, y = 1},
-        textures = {
-            "blank.png","blank.png","blank.png","blank.png","blank.png","blank.png"
-        },
+        textures = {"blank.png","blank.png","blank.png","blank.png","blank.png","blank.png"},
         static_save = true,
     },
 
     driver_name = nil,
-    driver_offset = nil, -- offset (float) du joueur par rapport à structure.origin
-    old_physics = nil,   -- physics_override sauvegardé du conducteur
+    driver_offset = nil, -- position relative (float) du joueur
+    old_physics = nil,
     structure = nil,
 
-    move_speed = 5,
-    vertical_speed = 4,
+    -- Mouvement fluide
+    vel = {x=0, y=0, z=0},
+    accel = 18,
+    friction = 10,
+    max_speed = 6,   -- horiz (blocs/s)
+    max_vspeed = 4,  -- vertical (blocs/s)
 
     on_activate = function(self, staticdata, dtime_s)
         if staticdata and staticdata ~= "" then
@@ -517,12 +505,12 @@ minetest.register_entity("moving_nodes:vehicle", {
                 self.structure = data.structure
             end
         end
+        -- S’assurer que vel existe
+        self.vel = self.vel or {x=0,y=0,z=0}
     end,
 
     get_staticdata = function(self)
-        return minetest.serialize({
-            structure = self.structure,
-        })
+        return minetest.serialize({ structure = self.structure })
     end,
 
     on_step = function(self, dtime)
@@ -533,10 +521,11 @@ minetest.register_entity("moving_nodes:vehicle", {
 
         local driver = self.driver_name and minetest.get_player_by_name(self.driver_name)
         if not driver then
-            -- Si le conducteur n’existe plus (déco), on libère le véhicule
             self.driver_name = nil
             self.driver_offset = nil
             self.old_physics = nil
+            -- amortir progressivement
+            self.vel.x, self.vel.y, self.vel.z = 0, 0, 0
             return
         end
 
@@ -568,62 +557,106 @@ minetest.register_entity("moving_nodes:vehicle", {
             dir.z = dir.z + right.z
         end
 
-        if ctrl.jump then
-            dir.y = dir.y + self.vertical_speed
-        end
-        if ctrl.sneak then
-            dir.y = dir.y - self.vertical_speed
-        end
+        -- vertical : jump/sneak
+        if ctrl.jump then dir.y = dir.y + self.max_vspeed end
+        if ctrl.sneak then dir.y = dir.y - self.max_vspeed end
 
+        -- normalisation horizontale
         local horiz_len = math.sqrt(dir.x * dir.x + dir.z * dir.z)
         if horiz_len > 0 then
             dir.x = dir.x / horiz_len
             dir.z = dir.z / horiz_len
         end
 
-        if dir.x == 0 and dir.y == 0 and dir.z == 0 then
-            -- Même sans input, on recale le joueur “parfaitement”
-            if self.driver_offset then
-                local target = vector.add(self.structure.origin, self.driver_offset)
-                driver:set_pos(target)
-                driver:set_velocity({x=0,y=0,z=0})
-            end
-            return
+        -- vitesse désirée
+        local desired = {
+            x = dir.x * self.max_speed,
+            y = dir.y, -- déjà en blocs/s
+            z = dir.z * self.max_speed,
+        }
+
+        local function approach(cur, target, rate, dt)
+            local diff = target - cur
+            local step = rate * dt
+            if diff > step then return cur + step end
+            if diff < -step then return cur - step end
+            return target
         end
 
+        local ax = (math.abs(desired.x) > 0.001) and self.accel or self.friction
+        local az = (math.abs(desired.z) > 0.001) and self.accel or self.friction
+        local ay = (math.abs(desired.y) > 0.001) and self.accel or self.friction
+
+        self.vel.x = approach(self.vel.x, desired.x, ax, dtime)
+        self.vel.y = approach(self.vel.y, desired.y, ay, dtime)
+        self.vel.z = approach(self.vel.z, desired.z, az, dtime)
+
         local delta = {
-            x = dir.x * self.move_speed * dtime,
-            y = dir.y * dtime,
-            z = dir.z * self.move_speed * dtime,
+            x = self.vel.x * dtime,
+            y = self.vel.y * dtime,
+            z = self.vel.z * dtime,
         }
 
         -- arrondi léger
         local function round2(v) return math.floor(v * 100 + 0.5) / 100 end
         delta.x, delta.y, delta.z = round2(delta.x), round2(delta.y), round2(delta.z)
 
-        -- Collisions
-        if not can_move_structure(self.structure, delta) then
-            -- collision : recale le joueur tout de même
-            if self.driver_offset then
-                local target = vector.add(self.structure.origin, self.driver_offset)
-                driver:set_pos(target)
-                driver:set_velocity({x=0,y=0,z=0})
+        -- Collisions + glissement sur les murs (axes séparés)
+        local function try_move_axis(d)
+            if (d.x == 0 and d.y == 0 and d.z == 0) then return false end
+            if can_move_structure(self.structure, d) then
+                move_structure(self.structure, d)
+                return true
             end
-            return
+            return false
         end
 
-        -- Déplacer structure
-        move_structure(self.structure, delta)
+        if not can_move_structure(self.structure, delta) then
+            local moved = false
 
-        -- Sync entité sur origin (optionnel mais propre)
-        local veh_pos = world_pos_from_origin(self.structure.origin, {x=0,y=0,z=0})
-        self.object:set_pos(veh_pos)
+            -- X
+            if delta.x ~= 0 then
+                if try_move_axis({x=delta.x, y=0, z=0}) then
+                    moved = true
+                else
+                    self.vel.x = 0
+                end
+            end
+            -- Y
+            if delta.y ~= 0 then
+                if try_move_axis({x=0, y=delta.y, z=0}) then
+                    moved = true
+                else
+                    self.vel.y = 0
+                end
+            end
+            -- Z
+            if delta.z ~= 0 then
+                if try_move_axis({x=0, y=0, z=delta.z}) then
+                    moved = true
+                else
+                    self.vel.z = 0
+                end
+            end
 
-        -- Maintenir le conducteur exactement au même endroit relatif
+            -- si rien n'a bougé : stop complet
+            if not moved then
+                self.vel.x, self.vel.y, self.vel.z = 0, 0, 0
+            end
+        else
+            move_structure(self.structure, delta)
+        end
+
+        -- Entité en FLOAT (fluide)
+        self.object:set_pos(self.structure.origin)
+
+        -- Maintenir conducteur précisément, sans casser l’interpolation
         if self.driver_offset then
             local target = vector.add(self.structure.origin, self.driver_offset)
-            driver:set_pos(target)
-            driver:set_velocity({x=0,y=0,z=0})
+            local p = driver:get_pos()
+            if (not p) or vector.distance(p, target) > 0.05 then
+                driver:set_pos(target)
+            end
         end
     end,
 })
@@ -641,7 +674,6 @@ minetest.register_tool("moving_nodes:harness", {
         local name = user:get_player_name()
         local player_pos = user:get_pos()
 
-        -- Cas : véhicule existe
         if current_vehicle then
             local ent = current_vehicle:get_luaentity()
             if not ent or not ent.structure or not ent.structure.origin then
@@ -649,7 +681,7 @@ minetest.register_tool("moving_nodes:harness", {
                 return itemstack
             end
 
-            -- Si conducteur -> descendre
+            -- descendre
             if ent.driver_name == name then
                 ent.driver_name = nil
                 ent.driver_offset = nil
@@ -663,7 +695,7 @@ minetest.register_tool("moving_nodes:harness", {
                 return itemstack
             end
 
-            -- Si libre -> monter (position exacte)
+            -- monter
             if not ent.driver_name then
                 ent.driver_name = name
 
@@ -672,7 +704,7 @@ minetest.register_tool("moving_nodes:harness", {
 
                 ent.driver_offset = vector.subtract(player_pos, ent.structure.origin)
 
-                minetest.chat_send_player(name, "[moving_nodes] Tu montes dans le véhicule (position exacte).")
+                minetest.chat_send_player(name, "[moving_nodes] Tu montes dans le véhicule.")
                 return itemstack
             else
                 minetest.chat_send_player(name, "[moving_nodes] Véhicule déjà conduit par " .. ent.driver_name .. ".")
@@ -680,7 +712,7 @@ minetest.register_tool("moving_nodes:harness", {
             end
         end
 
-        -- Cas : pas de véhicule -> en créer un depuis builder
+        -- créer véhicule depuis builder
         if not builder.origin or #builder.nodes == 0 then
             minetest.chat_send_player(name, "[moving_nodes] Aucune structure définie. Utilise glue ou /moving_nodes_fill.")
             return itemstack
@@ -708,7 +740,7 @@ minetest.register_tool("moving_nodes:harness", {
 
         ent.driver_offset = vector.subtract(player_pos, ent.structure.origin)
 
-        minetest.chat_send_player(name, "[moving_nodes] Véhicule créé. Position exacte conservée.")
+        minetest.chat_send_player(name, "[moving_nodes] Véhicule créé. Mouvement fluide activé.")
         return itemstack
     end,
 })
@@ -783,7 +815,7 @@ minetest.register_chatcommand("moving_nodes_delete", {
 
 minetest.register_chatcommand("moving_nodes_load", {
     params = "<nom>",
-    description = "Charge un plan et recrée la structure à la position du joueur (puis harnais pour créer le véhicule)",
+    description = "Charge un plan et recrée la structure à la position du joueur (puis harnais)",
     func = function(name, param)
         local bp_name = param:match("^(%S+)$")
         if not bp_name then
